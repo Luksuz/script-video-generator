@@ -1,5 +1,6 @@
 import type { Metadata } from 'next'
 import './globals.css'
+import { Toaster } from "@/components/ui/toaster"
 
 export const metadata: Metadata = {
   title: 'Script to Video Generator',
@@ -18,6 +19,7 @@ export default function RootLayout({
         <div className="relative flex min-h-screen flex-col">
           <div className="flex-1">{children}</div>
         </div>
+        <Toaster />
       </body>
     </html>
   )

@@ -1,0 +1,131 @@
+import { type NextRequest, NextResponse } from "next/server"
+import { generateText } from "ai"
+import { openai } from "@ai-sdk/openai"
+
+// Import API functions from the main script processing route
+import { searchPexelsVideos, searchPixabayVideos, searchImages, generateAIImage } from "../process-script/helpers"
+
+type VideoProvider = "pexels" | "pixabay"
+
+// Function to search videos based on provider
+async function searchVideos(query: string, provider: VideoProvider) {
+  return provider === "pexels" ? searchPexelsVideos(query) : searchPixabayVideos(query)
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json()
+    const { sectionIndex, customQuery, mode, provider, theme, generateNewQuery, generateAiImages } = body
+
+    if (typeof sectionIndex !== 'number') {
+      return NextResponse.json({ error: "Invalid section index" }, { status: 400 })
+    }
+
+    if (!['images', 'videos', 'mixed'].includes(mode)) {
+      return NextResponse.json({ error: "Invalid mode" }, { status: 400 })
+    }
+
+    if (!['pexels', 'pixabay'].includes(provider)) {
+      return NextResponse.json({ error: "Invalid provider" }, { status: 400 })
+    }
+
+    let searchQuery = customQuery
+
+    // Generate new query based on custom input if requested
+    if (generateNewQuery && customQuery && typeof customQuery === 'string') {
+      const segment = customQuery.trim()
+      
+      // Prepare the theme context for the prompt
+      const themeContext = theme ? `This script is about: "${theme}". ` : "";
+      
+      const { text: query } = await generateText({
+        model: openai("gpt-4o-mini"),
+        prompt: `
+          ${themeContext}Create a short, specific search query for finding ${mode === "images" ? "an image" : "a video"} that matches this text (4 words max).
+          The text might be a question, a reference to a scene name, a meme or similar, you have to provide a query
+          that refers to general known objects.
+
+          Text:
+          "${segment}"
+          
+          ${theme ? `Remember, the overall theme is: "${theme}".` : ""}
+          
+          The query will be used to search for ${mode === "images" ? "images on Google Images" : `stock videos on ${provider === "pexels" ? "Pexels" : "Pixabay"}`}.
+          Return ONLY the search query, no explanations or quotes.
+          Make it descriptive of the visual scene, not just repeating the words.
+        `,
+      })
+      
+      searchQuery = query.trim()
+    } else if (typeof customQuery === 'string') {
+      // Sanitize the custom query
+      searchQuery = customQuery.trim().substring(0, 100)
+    } else {
+      return NextResponse.json({ error: "Invalid custom query" }, { status: 400 })
+    }
+
+    console.log(`Regenerating content for section ${sectionIndex} with query: "${searchQuery}"`)
+
+    // Generate content based on the selected mode
+    let videos = []
+    let images = []
+    let aiImage = null
+
+    if (mode === "videos" || mode === "mixed") {
+      const videoResponse = await searchVideos(searchQuery, provider as VideoProvider)
+      videos = videoResponse.videos
+    }
+
+    if (mode === "images" || mode === "mixed") {
+      const imageResponse = await searchImages(searchQuery)
+      images = imageResponse
+    }
+
+    // Generate an AI image if requested
+    if (generateAiImages) {
+      try {
+        // Create a better prompt for AI image generation
+        let aiPrompt = "";
+        
+        // If the theme is provided, include it for context
+        if (theme) {
+          aiPrompt += `Theme: ${theme}. `;
+        }
+        
+        // Add the custom query for context
+        aiPrompt += `Create a visual representation of: "${customQuery}". `;
+        
+        // Add the search query for more specific guidance
+        aiPrompt += `Focus on: ${searchQuery}.`;
+        
+        aiImage = await generateAIImage(aiPrompt);
+        
+        // Add the AI image to the beginning of the regular images array
+        images.unshift({
+          ...aiImage,
+          isAiGenerated: true
+        });
+        
+        console.log(`Generated AI image for custom query: "${customQuery}"`);
+      } catch (error) {
+        console.error(`Failed to generate AI image for custom query:`, error);
+        // Continue processing even if AI image generation fails
+      }
+    }
+
+    return NextResponse.json({
+      success: true,
+      sectionIndex,
+      query: searchQuery,
+      videos,
+      images,
+      aiImage
+    })
+  } catch (error) {
+    console.error("Error regenerating content:", error)
+    return NextResponse.json({ 
+      error: "Failed to regenerate content", 
+      details: error instanceof Error ? error.message : "Unknown error" 
+    }, { status: 500 })
+  }
+} 

@@ -2,16 +2,18 @@
 
 import { useEffect, useState } from "react"
 import Link from "next/link"
-import { ArrowLeft, Download, Loader2, Film } from "lucide-react"
+import { ArrowLeft, Download, Loader2, Film, RefreshCw } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Progress } from "@/components/ui/progress"
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Input } from "@/components/ui/input"
+import { toast } from "@/components/ui/use-toast"
 
 interface ContentResult {
-  sentence: string
+  segment: string
   query: string
   videos: {
     id: string
@@ -27,16 +29,27 @@ interface ContentResult {
     width: number
     height: number
     thumbnail: string
+    isAiGenerated?: boolean
+    revisedPrompt?: string
+  }[]
+  aiImages?: {
+    url: string
+    width: number
+    height: number
+    thumbnail: string
+    revisedPrompt?: string
   }[]
   imageDurations: number[]
+  segmentDuration: number
   sectionType?: 'video' | 'image'
 }
 
 interface ProcessingResults {
   wordCount: number
-  durationInMinutes: number
-  totalVideosNeeded: number
-  totalImagesNeeded: number
+  totalDurationInSeconds: number
+  totalSegments: number
+  wordsPerSegment: number
+  targetSegmentDuration: number
   contentResults: ContentResult[]
   provider: "pexels" | "pixabay"
   mode: "images" | "videos" | "mixed"
@@ -45,10 +58,12 @@ interface ProcessingResults {
     imagesPerMinute: number
     imageDurationRange: [number, number]
   }
+  theme?: string
+  generateAiImages?: boolean
 }
 
-function getSectionKey(index: number, sentence: string): string {
-  return `section-${index}-${sentence}`
+function getSectionKey(index: number, segment: string): string {
+  return `section-${index}-${segment}`
 }
 
 export default function ResultsPage() {
@@ -59,6 +74,8 @@ export default function ResultsPage() {
   const [concatenating, setConcatenating] = useState(false)
   const [finalVideo, setFinalVideo] = useState<string | null>(null)
   const [sectionTypes, setSectionTypes] = useState<('video' | 'image')[]>([])
+  const [customQueries, setCustomQueries] = useState<Record<number, string>>({})
+  const [regeneratingSection, setRegeneratingSection] = useState<number | null>(null)
 
   useEffect(() => {
     const fetchResults = async () => {
@@ -89,7 +106,7 @@ export default function ResultsPage() {
         const initialSelected: Record<string, { type: "video" | "image", index: number }> = {}
         data.contentResults.forEach((result, index) => {
           const sectionType = types[index]
-          const sectionKey = getSectionKey(index, result.sentence)
+          const sectionKey = getSectionKey(index, result.segment)
           if (sectionType === 'video' && result.videos?.length > 0) {
             initialSelected[sectionKey] = { type: "video", index: 0 }
           } else if (sectionType === 'image' && result.images?.length > 0) {
@@ -108,8 +125,8 @@ export default function ResultsPage() {
     fetchResults()
   }, [])
 
-  const handleSelectContent = (index: number, sentence: string, type: "video" | "image", contentIndex: number) => {
-    const sectionKey = getSectionKey(index, sentence)
+  const handleSelectContent = (index: number, segment: string, type: "video" | "image", contentIndex: number) => {
+    const sectionKey = getSectionKey(index, segment)
     setSelectedContent((prev) => ({
       ...prev,
       [sectionKey]: { type, index: contentIndex },
@@ -123,10 +140,10 @@ export default function ResultsPage() {
     try {
       // Get selected content with their durations
       const contentSequence = results.contentResults.map((result, index) => {
-        const sectionKey = getSectionKey(index, result.sentence)
+        const sectionKey = getSectionKey(index, result.segment)
         const selection = selectedContent[sectionKey]
         if (!selection) {
-          throw new Error(`No content selected for section ${index + 1}: ${result.sentence}`)
+          throw new Error(`No content selected for section ${index + 1}: ${result.segment}`)
         }
 
         if (selection.type === "video") {
@@ -134,7 +151,7 @@ export default function ResultsPage() {
           return {
             type: "video" as const,
             contentId: video.downloadUrl,
-            duration: video.duration,
+            duration: result.segmentDuration,
             sectionIndex: index
           }
         } else {
@@ -142,7 +159,7 @@ export default function ResultsPage() {
           return {
             type: "image" as const,
             contentId: image.url,
-            duration: Math.floor(result.imageDurations[selection.index]),
+            duration: result.segmentDuration,
             sectionIndex: index
           }
         }
@@ -196,17 +213,100 @@ export default function ResultsPage() {
   const calculateTotalDuration = () => {
     if (!results) return 0
     
-    return Math.floor(results.contentResults.reduce((total, result, index) => {
-      const sectionKey = getSectionKey(index, result.sentence)
-      const selection = selectedContent[sectionKey]
-      if (!selection) return total
-
-      if (selection.type === "video") {
-        return total + (result.videos[selection.index]?.duration || 0)
-      } else {
-        return total + Math.floor(result.imageDurations[selection.index] || 0)
-      }
+    return Math.floor(results.contentResults.reduce((total, result) => {
+      return total + result.segmentDuration;
     }, 0))
+  }
+
+  // Add a function to handle custom query input change
+  const handleCustomQueryChange = (index: number, query: string) => {
+    setCustomQueries(prev => ({
+      ...prev,
+      [index]: query
+    }))
+  }
+
+  // Add a function to regenerate content for a specific section
+  const regenerateContent = async (index: number) => {
+    if (!results) return
+    
+    const customQuery = customQueries[index]
+    if (!customQuery || customQuery.trim() === '') {
+      toast({
+        title: "Empty query",
+        description: "Please enter a custom query first",
+        variant: "destructive"
+      })
+      return
+    }
+    
+    setRegeneratingSection(index)
+    
+    try {
+      const response = await fetch("/api/regenerate-content", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          sectionIndex: index,
+          customQuery,
+          mode: results.mode,
+          provider: results.provider,
+          theme: results.theme || "",
+          generateNewQuery: true,
+          generateAiImages: results.generateAiImages || false
+        }),
+      })
+      
+      if (!response.ok) {
+        const errorData = await response.json()
+        throw new Error(errorData.error || "Failed to regenerate content")
+      }
+      
+      const data = await response.json()
+      
+      // Update results with new content
+      setResults(prev => {
+        if (!prev) return prev
+        
+        const newContentResults = [...prev.contentResults]
+        newContentResults[index] = {
+          ...newContentResults[index],
+          query: data.query || customQuery,
+          videos: data.videos || newContentResults[index].videos,
+          images: data.images || newContentResults[index].images,
+          aiImages: data.aiImage ? [data.aiImage] : newContentResults[index].aiImages
+        }
+        
+        return {
+          ...prev,
+          contentResults: newContentResults
+        }
+      })
+      
+      // Update selected content to show the first new item
+      const sectionKey = getSectionKey(index, results.contentResults[index].segment)
+      const sectionType = sectionTypes[index]
+      setSelectedContent(prev => ({
+        ...prev,
+        [sectionKey]: { type: sectionType, index: 0 }
+      }))
+      
+      toast({
+        title: "Content regenerated",
+        description: "New content has been generated based on your input"
+      })
+    } catch (err) {
+      console.error("Error regenerating content:", err)
+      toast({
+        title: "Error",
+        description: err instanceof Error ? err.message : "Failed to regenerate content",
+        variant: "destructive"
+      })
+    } finally {
+      setRegeneratingSection(null)
+    }
   }
 
   if (loading) {
@@ -254,7 +354,7 @@ export default function ResultsPage() {
           <div>
             <h1 className="text-3xl font-bold tracking-tight">Video Results</h1>
             <p className="text-muted-foreground">
-              {results.wordCount} words | {results.durationInMinutes.toFixed(2)} minutes | {results.totalVideosNeeded} videos | {results.totalImagesNeeded} images
+              {results.wordCount} words | {(results.totalDurationInSeconds / 60).toFixed(2)} minutes | {results.totalSegments} segments
             </p>
             <p className="text-muted-foreground">
               Total Duration: {calculateTotalDuration()} seconds
@@ -315,7 +415,7 @@ export default function ResultsPage() {
           {results.contentResults.map((result, index) => {
             const sectionType = sectionTypes[index]
             return (
-              <Card key={getSectionKey(index, result.sentence)} className="overflow-hidden">
+              <Card key={getSectionKey(index, result.segment)} className="overflow-hidden">
                 <CardHeader className="p-4">
                   <CardTitle className="text-lg flex items-center gap-2">
                     <span>Section {index + 1}</span>
@@ -324,8 +424,36 @@ export default function ResultsPage() {
                     </span>
                   </CardTitle>
                   <CardDescription>
-                    <div>Sentence: {result.sentence}</div>
+                    <div>Segment: {result.segment}</div>
                     <div className="mt-1">Search query: "{result.query}"</div>
+                    
+                    {/* Add custom query input and regenerate button */}
+                    <div className="mt-3 flex gap-2 items-center">
+                      <Input 
+                        placeholder="Enter custom query..."
+                        value={customQueries[index] || ''}
+                        onChange={(e) => handleCustomQueryChange(index, e.target.value)}
+                        className="flex-1"
+                      />
+                      <Button 
+                        size="sm"
+                        variant="outline"
+                        onClick={() => regenerateContent(index)}
+                        disabled={regeneratingSection === index}
+                      >
+                        {regeneratingSection === index ? (
+                          <>
+                            <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                            Regenerating...
+                          </>
+                        ) : (
+                          <>
+                            <RefreshCw className="mr-1 h-3 w-3" />
+                            Regenerate
+                          </>
+                        )}
+                      </Button>
+                    </div>
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="p-0">
@@ -343,9 +471,9 @@ export default function ResultsPage() {
                           <TabsTrigger
                             key={video.id}
                             value={`video-${videoIndex}-${index}`}
-                            onClick={() => handleSelectContent(index, result.sentence, "video", videoIndex)}
-                            className={selectedContent[getSectionKey(index, result.sentence)]?.type === "video" && 
-                                     selectedContent[getSectionKey(index, result.sentence)]?.index === videoIndex ? "border-primary" : ""}
+                            onClick={() => handleSelectContent(index, result.segment, "video", videoIndex)}
+                            className={selectedContent[getSectionKey(index, result.segment)]?.type === "video" && 
+                                     selectedContent[getSectionKey(index, result.segment)]?.index === videoIndex ? "border-primary" : ""}
                           >
                             Video {videoIndex + 1}
                           </TabsTrigger>
@@ -354,9 +482,9 @@ export default function ResultsPage() {
                           <TabsTrigger
                             key={`${image.url}-${imageIndex}`}
                             value={`image-${imageIndex}-${index}`}
-                            onClick={() => handleSelectContent(index, result.sentence, "image", imageIndex)}
-                            className={selectedContent[getSectionKey(index, result.sentence)]?.type === "image" && 
-                                     selectedContent[getSectionKey(index, result.sentence)]?.index === imageIndex ? "border-primary" : ""}
+                            onClick={() => handleSelectContent(index, result.segment, "image", imageIndex)}
+                            className={selectedContent[getSectionKey(index, result.segment)]?.type === "image" && 
+                                     selectedContent[getSectionKey(index, result.segment)]?.index === imageIndex ? "border-primary" : ""}
                           >
                             Image {imageIndex + 1}
                           </TabsTrigger>
@@ -387,7 +515,7 @@ export default function ResultsPage() {
                         </div>
                         <div className="p-4 bg-muted/50">
                           <p className="text-sm text-muted-foreground">
-                            Duration: {video.duration}s | Resolution: {video.width}x{video.height}
+                            Target Duration: {result.segmentDuration.toFixed(1)}s | Actual Duration: {video.duration}s | Resolution: {video.width}x{video.height}
                           </p>
                         </div>
                       </TabsContent>
@@ -400,6 +528,11 @@ export default function ResultsPage() {
                             alt={`Image preview for ${result.query}`}
                             className="w-full h-full object-cover"
                           />
+                          {image.isAiGenerated && (
+                            <div className="absolute top-2 left-2 bg-primary text-primary-foreground text-xs px-2 py-1 rounded-md">
+                              AI Generated
+                            </div>
+                          )}
                           <div className="absolute bottom-4 right-4 flex gap-2">
                             <Button size="sm" variant="secondary" asChild>
                               <a href={image.url} target="_blank" rel="noopener noreferrer">
@@ -411,7 +544,13 @@ export default function ResultsPage() {
                         </div>
                         <div className="p-4 bg-muted/50">
                           <p className="text-sm text-muted-foreground">
-                            Duration: {Math.floor(result.imageDurations[imageIndex])}s | Resolution: {image.width}x{image.height}
+                            Target Duration: {result.segmentDuration.toFixed(1)}s | Resolution: {image.width}x{image.height}
+                            {image.isAiGenerated && image.revisedPrompt && (
+                              <>
+                                <br />
+                                <span className="font-medium">AI prompt:</span> {image.revisedPrompt}
+                              </>
+                            )}
                           </p>
                         </div>
                       </TabsContent>
