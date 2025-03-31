@@ -11,6 +11,7 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Textarea } from "@/components/ui/textarea"
 
 export default function Home() {
   const router = useRouter()
@@ -20,6 +21,8 @@ export default function Home() {
   const [imageDurationRange, setImageDurationRange] = useState<[number, number]>([2, 5])
   const [provider, setProvider] = useState<"pexels" | "pixabay">("pexels")
   const [mode, setMode] = useState<"images" | "videos" | "mixed">("videos")
+  const [theme, setTheme] = useState<string>("")
+  const [generateAiImages, setGenerateAiImages] = useState<boolean>(false)
   const [isLoading, setIsLoading] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
   const [isDragging, setIsDragging] = useState<boolean>(false)
@@ -83,16 +86,24 @@ export default function Home() {
     formData.append("file", file)
     formData.append("mode", mode)
     formData.append("provider", provider)
+    formData.append("theme", theme)
+    formData.append("generateAiImages", generateAiImages.toString())
     
     // Add parameters based on mode
     if (mode === "videos" || mode === "mixed") {
       formData.append("videosPerMinute", videosPerMinute.toString())
     }
+    
     if (mode === "images" || mode === "mixed") {
       formData.append("imagesPerMinute", imagesPerMinute.toString())
       formData.append("imageDurationMin", imageDurationRange[0].toString())
       formData.append("imageDurationMax", imageDurationRange[1].toString())
     }
+
+    console.log(formData.get("videosPerMinute"))
+    console.log(formData.get("imagesPerMinute"))
+    console.log(formData.get("imageDurationMin"))
+    console.log(formData.get("imageDurationMax"))
 
     try {
       const response = await fetch("/api/process-script", {
@@ -151,6 +162,22 @@ export default function Home() {
               </div>
               {file && <p className="text-sm text-muted-foreground">Selected file: {file.name}</p>}
             </div>
+            
+            <div className="space-y-2">
+              <Label htmlFor="theme">Theme (Optional)</Label>
+              <Textarea
+                id="theme"
+                placeholder="Enter a theme or context for your script (e.g., 'educational video about planets', 'corporate training')"
+                value={theme}
+                onChange={(e) => setTheme(e.target.value)}
+                className="resize-none"
+                rows={2}
+              />
+              <p className="text-xs text-muted-foreground">
+                Providing a theme helps generate more relevant visuals for your script
+              </p>
+            </div>
+            
             <div className="space-y-2">
               <Label htmlFor="mode">Content Mode</Label>
               <Select value={mode} onValueChange={(value: "images" | "videos" | "mixed") => setMode(value)}>
@@ -175,12 +202,12 @@ export default function Home() {
                   id="videosPerMinute"
                   type="number"
                   min="1"
-                  max="60"
+                  max="30"
                   value={videosPerMinute}
                   onChange={(e) => setVideosPerMinute(Number.parseInt(e.target.value))}
                 />
                 <p className="text-xs text-muted-foreground">
-                  How many video clips you want per minute of speech
+                  How many videos you want per minute of speech
                 </p>
               </div>
             )}
@@ -242,6 +269,22 @@ export default function Home() {
               </Select>
               <p className="text-xs text-muted-foreground">
                 Choose which provider to use for searching content
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center space-x-2">
+                <input
+                  type="checkbox"
+                  id="generateAiImages"
+                  checked={generateAiImages}
+                  onChange={(e) => setGenerateAiImages(e.target.checked)}
+                  className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary"
+                />
+                <Label htmlFor="generateAiImages">Generate AI images (DALL-E 3)</Label>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Create custom AI-generated images for each segment of your script
               </p>
             </div>
 
