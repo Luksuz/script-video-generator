@@ -8,6 +8,15 @@ import OpenAI from "openai";
 
 export type VideoProvider = "pexels" | "pixabay"
 
+// Rate limiting settings
+const RATE_LIMIT = {
+  maxRequestsPerMinute: 7,
+  requestInterval: 60000 / 7, // Milliseconds between requests (approx 8.6 seconds)
+  backoffFactor: 1.5, // Exponential backoff factor
+  maxRetries: 3, // Maximum number of retries
+  lastRequestTime: 0, // Timestamp of the last request
+}
+
 // Initialize OpenAI client
 let openaiClient: OpenAI | null = null;
 
@@ -24,15 +33,32 @@ function getOpenAIClient() {
   return openaiClient;
 }
 
-// Generate images using DALL-E 3
-export async function generateAIImage(prompt: string) {
+// Sleep function for delay
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Generate images using DALL-E 3 with rate limiting
+export async function generateAIImage(prompt: string, retryCount: number = 0) {
   try {
     const client = getOpenAIClient();
     
     // Enhanced prompt with better instructions
     const enhancedPrompt = `Create a high-quality, realistic image for a video presentation that depicts: ${prompt}. Make it visually appealing, well-composed, and suitable for a professional presentation. The image should be clean, clear, and focused on the main subject.`;
     
-    console.log(`Generating AI image for prompt: "${prompt}"`);
+    // Calculate time since last request
+    const now = Date.now();
+    const timeSinceLastRequest = now - RATE_LIMIT.lastRequestTime;
+    
+    // If we need to wait to respect rate limit
+    if (timeSinceLastRequest < RATE_LIMIT.requestInterval) {
+      const waitTime = RATE_LIMIT.requestInterval - timeSinceLastRequest;
+      console.log(`Rate limiting - waiting ${Math.round(waitTime / 1000)} seconds before next AI image request`);
+      await sleep(waitTime);
+    }
+    
+    // Update last request time
+    RATE_LIMIT.lastRequestTime = Date.now();
+    
+    console.log(`Generating AI image for prompt: "${prompt.substring(0, 50)}..."`);
     
     const response = await client.images.generate({
       model: "dall-e-3",
@@ -50,7 +76,25 @@ export async function generateAIImage(prompt: string) {
       revisedPrompt: response.data[0].revised_prompt,
       thumbnail: response.data[0].url, // Use the same URL as thumbnail
     };
-  } catch (error) {
+  } catch (error: any) {
+    // Check if it's a rate limit error
+    const isRateLimit = error.status === 429 || 
+                        (error.message && error.message.includes("rate limit")) ||
+                        (error.error && error.error.message && error.error.message.includes("rate limit"));
+    
+    if (isRateLimit && retryCount < RATE_LIMIT.maxRetries) {
+      // Calculate backoff time using exponential backoff
+      const backoffTime = RATE_LIMIT.requestInterval * Math.pow(RATE_LIMIT.backoffFactor, retryCount);
+      
+      console.warn(`Rate limit hit for AI image generation. Retrying in ${Math.round(backoffTime / 1000)} seconds... (Attempt ${retryCount + 1}/${RATE_LIMIT.maxRetries})`);
+      
+      // Wait for backoff period
+      await sleep(backoffTime);
+      
+      // Retry with incremented retry count
+      return generateAIImage(prompt, retryCount + 1);
+    }
+    
     console.error("Error generating AI image:", error);
     throw new Error(`Failed to generate AI image: ${error instanceof Error ? error.message : "Unknown error"}`);
   }

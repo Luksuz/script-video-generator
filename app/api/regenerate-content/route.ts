@@ -3,7 +3,7 @@ import { generateText } from "ai"
 import { openai } from "@ai-sdk/openai"
 
 // Import API functions from the main script processing route
-import { searchPexelsVideos, searchPixabayVideos, searchImages, generateAIImage } from "../process-script/helpers"
+import { searchPexelsVideos, searchPixabayVideos, searchImages, generateAIImage } from "@/app/api/process-script/helpers"
 
 type VideoProvider = "pexels" | "pixabay"
 
@@ -76,13 +76,15 @@ export async function POST(request: NextRequest) {
       videos = videoResponse.videos
     }
 
-    if (mode === "images" || mode === "mixed") {
+    // Only search for regular images if AI generation is not enabled
+    // or if we're in video-only mode (where images aren't used anyway)
+    if ((mode === "images" || mode === "mixed") && !generateAiImages) {
       const imageResponse = await searchImages(searchQuery)
       images = imageResponse
     }
 
     // Generate an AI image if requested
-    if (generateAiImages) {
+    if (generateAiImages && (mode === "images" || mode === "mixed")) {
       try {
         // Create a better prompt for AI image generation
         let aiPrompt = "";
@@ -98,18 +100,34 @@ export async function POST(request: NextRequest) {
         // Add the search query for more specific guidance
         aiPrompt += `Focus on: ${searchQuery}.`;
         
+        console.log(`Generating AI image for custom query: "${customQuery.substring(0, 50)}..."`);
+        
+        // Use the rate-limited image generation function
         aiImage = await generateAIImage(aiPrompt);
         
-        // Add the AI image to the beginning of the regular images array
-        images.unshift({
+        // When AI images are enabled, we replace the image array entirely
+        // rather than just adding the AI image at the beginning
+        images = [{
           ...aiImage,
           isAiGenerated: true
-        });
+        }];
         
-        console.log(`Generated AI image for custom query: "${customQuery}"`);
+        console.log(`Successfully generated AI image for custom query`);
       } catch (error) {
         console.error(`Failed to generate AI image for custom query:`, error);
-        // Continue processing even if AI image generation fails
+        
+        // If AI image generation fails, fall back to regular image search
+        if (mode === "images" || mode === "mixed") {
+          try {
+            console.log(`Falling back to regular image search for query: "${searchQuery}"`);
+            const imageResponse = await searchImages(searchQuery);
+            images = imageResponse;
+          } catch (searchError) {
+            console.error(`Failed to fall back to image search:`, searchError);
+            // Return empty array if both methods fail
+            images = [];
+          }
+        }
       }
     }
 

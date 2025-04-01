@@ -2,7 +2,7 @@
 
 import type React from "react"
 
-import { useState } from "react"
+import { useState, useEffect, useRef } from "react"
 import { useRouter } from "next/navigation"
 import { Loader2, Upload } from "lucide-react"
 
@@ -12,6 +12,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
+import { Progress } from "@/components/ui/progress"
 
 export default function Home() {
   const router = useRouter()
@@ -20,12 +21,24 @@ export default function Home() {
   const [imagesPerMinute, setImagesPerMinute] = useState<number>(20)
   const [imageDurationRange, setImageDurationRange] = useState<[number, number]>([2, 5])
   const [provider, setProvider] = useState<"pexels" | "pixabay">("pexels")
-  const [mode, setMode] = useState<"images" | "videos" | "mixed">("videos")
+  const [mode, setMode] = useState<"images" | "videos" | "mixed" | "ai-images">("videos")
   const [theme, setTheme] = useState<string>("")
-  const [generateAiImages, setGenerateAiImages] = useState<boolean>(false)
   const [isLoading, setIsLoading] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
   const [isDragging, setIsDragging] = useState<boolean>(false)
+  const [progressState, setProgressState] = useState<{ message: string; progress: number; total: number } | null>(null)
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Update image settings when AI images are selected
+  useEffect(() => {
+    if (mode === "ai-images") {
+      // Lower the images per minute for AI images to avoid rate limiting
+      setImagesPerMinute(7);
+    } else {
+      // Reset to default if switching away from AI images
+      setImagesPerMinute(20);
+    }
+  }, [mode]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0]
@@ -74,6 +87,7 @@ export default function Home() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    intervalRef.current && clearInterval(intervalRef.current);
 
     if (!file) {
       setError("Please upload a file")
@@ -81,47 +95,144 @@ export default function Home() {
     }
 
     setIsLoading(true)
+    setError(null)
+    setProgressState(null);
 
+    // --- Constants for Estimation ---
+    const WORDS_PER_MINUTE = 120;
+    const estimatedSecondsPerAiImage = 9; // Approx 8.6s request interval + processing time
+
+    // Determine if AI images should be generated based on the mode
+    const shouldGenerateAiImages = mode === "ai-images";
+    const contentMode = shouldGenerateAiImages ? "images" : mode;
+
+    let estimatedTotalAiTimeSeconds = 0;
+    let estimatedTotalSegments = 0;
+
+    // --- Estimate AI Generation Time (if applicable) ---
+    if (shouldGenerateAiImages) {
+      setProgressState({ progress: 0, message: "Estimating generation time...", total: 0 });
+      try {
+        const fileContent = await file.text();
+        const wordCount = fileContent.split(/\\s+/).filter(Boolean).length;
+        const totalDurationInSeconds = (wordCount / WORDS_PER_MINUTE) * 60;
+
+        // Use the fixed imagesPerMinute for AI mode
+        const aiImagesPerMinute = 7;
+        const segmentDurationInSeconds = 60 / aiImagesPerMinute;
+        estimatedTotalSegments = Math.ceil(totalDurationInSeconds / segmentDurationInSeconds);
+
+        if (estimatedTotalSegments > 0) {
+          estimatedTotalAiTimeSeconds = estimatedTotalSegments * estimatedSecondsPerAiImage;
+
+          // --- Start Timer & Show Progress ---
+          const startTime = Date.now();
+          setProgressState({
+            progress: 0,
+            message: "Generating AI images...",
+            total: estimatedTotalSegments // Use estimated segments for total
+          });
+
+          intervalRef.current = setInterval(() => {
+            const elapsedTimeSeconds = (Date.now() - startTime) / 1000;
+            const progressPercent = Math.min(100, Math.floor((elapsedTimeSeconds / estimatedTotalAiTimeSeconds) * 100));
+
+            setProgressState(prevState => ({
+              ...(prevState ?? { message: "Generating AI images...", total: estimatedTotalSegments }), // Keep message/total
+              progress: progressPercent,
+            }));
+
+            // Stop interval if time exceeds estimate (or it finishes below)
+            if (progressPercent >= 100) {
+               intervalRef.current && clearInterval(intervalRef.current);
+               intervalRef.current = null;
+            }
+          }, 500); // Update every 0.5 seconds
+        } else {
+           setProgressState(null); // No segments, no progress needed
+        }
+      } catch (err) {
+        console.error("Error estimating AI time:", err);
+        setError("Could not estimate generation time.");
+        setIsLoading(false);
+        setProgressState(null);
+        return; // Stop processing
+      }
+    } else {
+        // For non-AI modes, maybe show a simpler loading state
+        setProgressState({ progress: 0, message: "Processing script...", total: 0 });
+    }
+    // --- End Estimation ---
+
+
+    // --- Prepare FormData ---
     const formData = new FormData()
     formData.append("file", file)
-    formData.append("mode", mode)
+    formData.append("mode", contentMode)
     formData.append("provider", provider)
     formData.append("theme", theme)
-    formData.append("generateAiImages", generateAiImages.toString())
-    
-    // Add parameters based on mode
-    if (mode === "videos" || mode === "mixed") {
+    formData.append("generateAiImages", shouldGenerateAiImages.toString())
+
+    if (contentMode === "videos" || contentMode === "mixed") {
       formData.append("videosPerMinute", videosPerMinute.toString())
     }
-    
-    if (mode === "images" || mode === "mixed") {
-      formData.append("imagesPerMinute", imagesPerMinute.toString())
+    if (contentMode === "images" || contentMode === "mixed" || shouldGenerateAiImages) {
+      // Use the fixed 7 for AI mode, otherwise the state value
+      const currentImagesPerMinute = shouldGenerateAiImages ? 7 : imagesPerMinute;
+      formData.append("imagesPerMinute", currentImagesPerMinute.toString())
       formData.append("imageDurationMin", imageDurationRange[0].toString())
       formData.append("imageDurationMax", imageDurationRange[1].toString())
     }
+    // --- End Prepare FormData ---
 
-    console.log(formData.get("videosPerMinute"))
-    console.log(formData.get("imagesPerMinute"))
-    console.log(formData.get("imageDurationMin"))
-    console.log(formData.get("imageDurationMax"))
 
+    // --- Send Request ---
     try {
+      console.log("Sending request to /api/process-script...");
       const response = await fetch("/api/process-script", {
         method: "POST",
         body: formData,
-      })
+      });
 
       if (!response.ok) {
-        throw new Error("Failed to process script")
+          const errorData = await response.json().catch(() => ({ error: "Unknown error" }));
+          throw new Error(errorData.error || `Request failed with status ${response.status}`);
       }
 
+      const results = await response.json()
+
+      // Update progress to 100% as backend finished this step
+      setProgressState(prevState => ({
+        ...(prevState ?? { message: "Processing complete!", total: estimatedTotalSegments }),
+        progress: 100,
+        message: "Processing complete! Redirecting...",
+      }));
+
+      // Store results and navigate
+      localStorage.setItem("processingResults", JSON.stringify(results))
       router.push("/results")
-    } catch (err) {
-      setError("An error occurred while processing your script")
-      console.error(err)
+
+    } catch (err: any) {
+      console.error("Error processing script:", err);
+      setError(err.message || "An error occurred while processing your script");
+      setProgressState(null); // Clear progress on error
+      setIsLoading(false); // Set loading false on error
     } finally {
-      setIsLoading(false)
+      // --- Stop timer and cleanup ---
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+      // Don't set isLoading false immediately if navigating successfully
+      // It will be set to false only on error in the catch block
     }
+  }
+
+  // Function to calculate estimated time string
+  const getEstimatedTimeString = (totalSegments: number, ratePerMinute: number = 7): string => {
+    if (!totalSegments || totalSegments <= 0) return "";
+    const totalMinutes = Math.ceil(totalSegments / ratePerMinute);
+    return `~${totalMinutes} ${totalMinutes === 1 ? 'minute' : 'minutes'}`;
   }
 
   return (
@@ -180,7 +291,7 @@ export default function Home() {
             
             <div className="space-y-2">
               <Label htmlFor="mode">Content Mode</Label>
-              <Select value={mode} onValueChange={(value: "images" | "videos" | "mixed") => setMode(value)}>
+              <Select value={mode} onValueChange={(value: "images" | "videos" | "mixed" | "ai-images") => setMode(value)}>
                 <SelectTrigger>
                   <SelectValue placeholder="Select content mode" />
                 </SelectTrigger>
@@ -188,6 +299,7 @@ export default function Home() {
                   <SelectItem value="images">Images Only</SelectItem>
                   <SelectItem value="videos">Videos Only</SelectItem>
                   <SelectItem value="mixed">Mixed Content</SelectItem>
+                  <SelectItem value="ai-images">AI-Generated Images (DALL-E 3)</SelectItem>
                 </SelectContent>
               </Select>
               <p className="text-xs text-muted-foreground">
@@ -212,7 +324,7 @@ export default function Home() {
               </div>
             )}
 
-            {(mode === "images" || mode === "mixed") && (
+            {(mode === "images" || mode === "mixed" || mode === "ai-images") && (
               <>
                 <div className="space-y-2">
                   <Label htmlFor="imagesPerMinute">Images Per Minute</Label>
@@ -223,9 +335,12 @@ export default function Home() {
                     max="120"
                     value={imagesPerMinute}
                     onChange={(e) => setImagesPerMinute(Number.parseInt(e.target.value))}
+                    disabled={mode === "ai-images"}
                   />
                   <p className="text-xs text-muted-foreground">
-                    How many images you want per minute of speech
+                    {mode === "ai-images" 
+                      ? "Fixed at 7 images per minute to avoid rate limiting" 
+                      : "How many images you want per minute of speech"}
                   </p>
                 </div>
 
@@ -256,46 +371,47 @@ export default function Home() {
               </>
             )}
 
-            <div className="space-y-2">
-              <Label htmlFor="provider">Content Provider</Label>
-              <Select value={provider} onValueChange={(value: "pexels" | "pixabay") => setProvider(value)}>
-                <SelectTrigger>
-                  <SelectValue placeholder="Select a content provider" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="pexels">Pexels</SelectItem>
-                  <SelectItem value="pixabay">Pixabay</SelectItem>
-                </SelectContent>
-              </Select>
-              <p className="text-xs text-muted-foreground">
-                Choose which provider to use for searching content
-              </p>
-            </div>
-
-            <div className="space-y-2">
-              <div className="flex items-center space-x-2">
-                <input
-                  type="checkbox"
-                  id="generateAiImages"
-                  checked={generateAiImages}
-                  onChange={(e) => setGenerateAiImages(e.target.checked)}
-                  className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary"
-                />
-                <Label htmlFor="generateAiImages">Generate AI images (DALL-E 3)</Label>
+            {mode !== "ai-images" && (
+              <div className="space-y-2">
+                <Label htmlFor="provider">Content Provider</Label>
+                <Select value={provider} onValueChange={(value: "pexels" | "pixabay") => setProvider(value)}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select a content provider" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="pexels">Pexels</SelectItem>
+                    <SelectItem value="pixabay">Pixabay</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  Choose which provider to use for searching content
+                </p>
               </div>
-              <p className="text-xs text-muted-foreground">
-                Create custom AI-generated images for each segment of your script
-              </p>
-            </div>
+            )}
 
-            {error && <p className="text-sm text-destructive">{error}</p>}
+            {isLoading && progressState && (
+              <div className="space-y-2 pt-2">
+                <div className="flex justify-between text-sm font-medium">
+                  <span>{progressState.message}</span>
+                  {progressState.progress > 0 && <span>{progressState.progress}%</span>}
+                </div>
+                <Progress value={progressState.progress} className="h-2 w-full" />
+                {progressState.total > 0 && mode === "ai-images" && (
+                  <p className="text-xs text-muted-foreground text-right">
+                    Estimated time: {getEstimatedTimeString(progressState.total)}
+                  </p>
+                )}
+              </div>
+            )}
+
+            {error && <p className="text-sm text-destructive pt-2">{error}</p>}
           </CardContent>
           <CardFooter>
             <Button type="submit" className="w-full" disabled={isLoading || !file}>
               {isLoading ? (
                 <>
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Processing...
+                  {progressState?.message.startsWith("Estimating") ? "Estimating..." : "Processing..."}
                 </>
               ) : (
                 "Generate Content"

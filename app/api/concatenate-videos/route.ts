@@ -1,9 +1,12 @@
 import { NextRequest, NextResponse } from "next/server"
 import { spawn } from "child_process"
-import { writeFile, mkdir, unlink, readFile, stat } from "fs/promises"
+import { writeFile, unlink, readFile, stat, mkdir, rename } from "fs/promises"
 import { join } from "path"
 import { existsSync } from "fs"
-import { v4 as uuidv4 } from "uuid"
+import { promisify } from "util"
+import { exec } from "child_process"
+import path from "path"
+import * as tmp from 'tmp'
 
 // --- Configuration --- (Inspired by Python script)
 const TARGET_WIDTH = 854 // Keep 16:9 aspect ratio, smaller for web
@@ -20,6 +23,14 @@ const AUDIO_CODEC = "aac"
 const AUDIO_BITRATE = "128k"
 // --- End Configuration ---
 
+// Add interface for the request body
+interface RequestBody {
+  totalDuration?: number;
+  contentSequence?: ContentSequenceItem[];
+  videos?: VideoResult[];
+  images?: ImageResult[]; // Expect an array of ImageResult
+}
+
 const SERPAPI_KEY = process.env.SERPAPI_KEY
 
 // Add these interfaces at the top of the file, after the imports
@@ -28,6 +39,7 @@ interface ImageResult {
   width?: number
   height?: number
   thumbnail?: string
+  isAiGenerated?: boolean
 }
 
 interface VideoResult {
@@ -227,7 +239,23 @@ async function verifyImageFile(imagePath: string): Promise<void> {
   });
 }
 
-// Update downloadContent to detect SVG files from the content-type header
+// Add this function to validate images after download
+async function validateImage(imagePath: string): Promise<boolean> {
+  try {
+    // Use ffprobe to validate the image
+    const { stdout, stderr } = await promisify(exec)(
+      `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "${imagePath}"`
+    );
+    
+    // If ffprobe returns dimensions, the image is valid
+    return stdout.trim().split(',').length === 2;
+  } catch (error) {
+    console.error(`Invalid image detected at ${imagePath}:`, error);
+    return false;
+  }
+}
+
+// Update downloadContent to validate images after download
 async function downloadContent(url: string, outputPath: string, isVideo: boolean = false): Promise<void> {
   if (!isDownloadableUrl(url)) {
     throw new Error(`URL considered non-downloadable or from restricted domain: ${url}`)
@@ -271,7 +299,15 @@ async function downloadContent(url: string, outputPath: string, isVideo: boolean
   }
   
   // For non-SVG files, use the regular download process
-  return downloadContentInternal(url, outputPath, isVideo);
+  await downloadContentInternal(url, outputPath, isVideo);
+  
+  // For images, validate them after download
+  if (!isVideo) {
+    const isValid = await validateImage(outputPath);
+    if (!isValid) {
+      throw new Error(`Downloaded image is invalid or corrupted: ${outputPath}`);
+    }
+  }
 }
 
 // Move the existing download functionality to an internal function
@@ -602,14 +638,18 @@ async function standardizeVideo(
   })
 }
 
-async function createMixedMediaVideo(mediaList: MediaItem[], outputPath: string): Promise<void> {
+async function createMixedMediaVideo(
+  mediaList: MediaItem[],
+  outputPath: string,
+  sessionDir: string
+): Promise<void> {
   const tempFiles: string[] = []
   
   try {
     // Process each media item
     for (let i = 0; i < mediaList.length; i++) {
       const item = mediaList[i]
-      const tempOutput = join(process.cwd(), "temp", `temp_${i}_converted.mp4`)
+      const tempOutput = join(sessionDir, `temp_${i}_converted.mp4`)
       tempFiles.push(tempOutput)
       
       if (item.type === 'image') {
@@ -703,19 +743,26 @@ async function cleanupTempFiles(files: string[]): Promise<void> {
 
 // Update the POST handler to use batch downloading for images
 export async function POST(request: NextRequest) {
+  // Use tmp to create a temporary directory
+  const tempDir = tmp.dirSync({ unsafeCleanup: true, prefix: 'video-concat-' });
+  const sessionDir = tempDir.name;
+  console.log(`Created temporary session directory: ${sessionDir}`);
+
+  // Add listener to clean up if the request is aborted
+  request.signal.addEventListener('abort', () => {
+      console.log("Request aborted, cleaning up temporary directory:", sessionDir);
+      tempDir.removeCallback();
+  });
+
   try {
-    const body = await request.json()
+    // Use the RequestBody interface when parsing
+    const body: RequestBody = await request.json()
     console.log("Received request body:", body)
 
     const {
       totalDuration = 60,
-      contentSequence = [] as ContentSequenceItem[] 
+      contentSequence = [] as ContentSequenceItem[]
     } = body
-
-    // Create session directory
-    const sessionId = uuidv4()
-    const sessionDir = join(process.cwd(), "temp", sessionId)
-    await mkdir(sessionDir, { recursive: true })
 
     // Create maps for quick lookup, filtering out problematic URLs
     const videoMap = new Map(
@@ -756,10 +803,16 @@ export async function POST(request: NextRequest) {
           contentId,
           duration,
           sectionIndex,
-          outputPath: videoPath
+          outputPath: videoPath,
+          item: item
         };
       } else if (type === 'image') {
-        const imagePath = join(sessionDir, `image_${index}.jpg`);
+        // Look up the image details from the map
+        const imageDetails = imageMap.get(contentId);
+        // Determine the correct extension based on whether it's AI-generated
+        const isAi = imageDetails?.isAiGenerated === true;
+        const extension = isAi ? 'png' : 'jpg'; // Use png for AI images, jpg otherwise
+        const imagePath = join(sessionDir, `image_${index}.${extension}`);
         return {
           skip: false,
           index,
@@ -767,7 +820,8 @@ export async function POST(request: NextRequest) {
           contentId,
           duration,
           sectionIndex,
-          outputPath: imagePath
+          outputPath: imagePath,
+          item: item
         };
       } else {
         console.warn(`Unsupported content type '${type}' at index ${index}`);
@@ -904,18 +958,18 @@ export async function POST(request: NextRequest) {
       throw new Error("No valid media items could be processed from the content sequence.");
     }
 
-    // Create output path
-    const outputPath = join(sessionDir, "output.mp4")
+    // Define the path for the output file within the temporary session directory
+    const tempOutputPath = join(sessionDir, "output.mp4")
 
-    // Create the mixed media video with adjusted durations
-    await createMixedMediaVideo(mediaList, outputPath)
+    // Create the mixed media video in the temporary directory
+    await createMixedMediaVideo(mediaList, tempOutputPath, sessionDir)
 
     // Calculate the actual total duration from the processed media
     const actualTotalDuration = mediaList.reduce((sum, item) => sum + (item.duration || 0), 0);
 
+    // Video is generated but not moved to public, so no videoPath is returned.
     return NextResponse.json({
       success: true,
-      videoPath: `/api/videos/${sessionId}/output.mp4`,
       processedContent: mediaList.length,
       totalDuration: actualTotalDuration,
       failedItems: failedItems.length > 0 ? failedItems : undefined,
@@ -932,6 +986,10 @@ export async function POST(request: NextRequest) {
       error: "Failed to process content",
       details: error instanceof Error ? error.message : "Unknown error"
     }, { status: 500 })
+  } finally {
+      // Ensure cleanup happens when the request finishes (success or error)
+      console.log("Request finished, cleaning up temporary directory:", sessionDir);
+      tempDir.removeCallback();
   }
 }
 
@@ -964,4 +1022,127 @@ async function createBlackFrame(outputPath: string, width: number, height: numbe
       }
     });
   });
+}
+
+// Add a function to create a placeholder image if needed
+async function createPlaceholderImage(outputPath: string, width = 1024, height = 576): Promise<void> {
+  try {
+    // Create a simple colored placeholder using ffmpeg
+    await promisify(exec)(
+      `ffmpeg -f lavfi -i color=c=gray:s=${width}x${height} -frames:v 1 "${outputPath}"`
+    );
+    console.log(`Created placeholder image at ${outputPath}`);
+  } catch (error) {
+    console.error(`Failed to create placeholder image:`, error);
+    throw error;
+  }
+}
+
+// Add the convertImageToVideo function back
+async function convertImageToVideo(imagePath: string, outputPath: string, duration: number): Promise<void> {
+  try {
+    let imageToUse = imagePath;
+    
+    // Validate the image first
+    const isValid = await validateImage(imagePath);
+    if (!isValid) {
+      console.warn(`Invalid image detected, using placeholder instead: ${imagePath}`);
+      
+      // Generate a placeholder with the same name but _placeholder suffix
+      const placeholderPath = imagePath.replace(/\.[^/.]+$/, '_placeholder.jpg');
+      await createPlaceholderImage(placeholderPath);
+      imageToUse = placeholderPath;
+    }
+    
+    // Run the FFmpeg command with increased timeout for safety
+    const command = `ffmpeg -loop 1 -i "${imageToUse}" -c:v libx264 -t ${duration} -pix_fmt yuv420p -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" -y "${outputPath}"`;
+    
+    console.log(`Converting image to video: ${imageToUse} -> ${outputPath}`);
+    const { stdout, stderr } = await promisify(exec)(command, { timeout: 30000 });
+    
+    if (!existsSync(outputPath)) {
+      throw new Error(`Output file was not created: ${outputPath}`);
+    }
+    
+    // Clean up placeholder if we created one
+    if (imageToUse !== imagePath) {
+      await unlink(imageToUse).catch(e => console.error(`Failed to delete placeholder: ${e.message}`));
+    }
+    
+  } catch (error: any) {
+    console.error(`Image to video conversion failed for ${imagePath} with error: ${error.message}`);
+    
+    if (error.stderr) {
+      console.error(`FFmpeg output:\n${error.stderr}`);
+    }
+    
+    // Try one more time with a placeholder as last resort
+    try {
+      const emergencyPlaceholder = path.join(path.dirname(imagePath), 'emergency_placeholder.jpg');
+      await createPlaceholderImage(emergencyPlaceholder);
+      
+      const command = `ffmpeg -loop 1 -i "${emergencyPlaceholder}" -c:v libx264 -t ${duration} -pix_fmt yuv420p -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" -y "${outputPath}"`;
+      await promisify(exec)(command, { timeout: 30000 });
+      
+      // Clean up
+      await unlink(emergencyPlaceholder).catch(() => {});
+      
+      console.log(`Used emergency placeholder for failed conversion: ${imagePath}`);
+    } catch (fallbackError) {
+      console.error(`Even emergency placeholder failed:`, fallbackError);
+      throw error; // Throw the original error
+    }
+  }
+}
+
+// Update the main processing function to use the enhanced image conversion
+async function processContent(contentSequence: ContentSequenceItem[], tempDir: string): Promise<string[]> {
+  const processedFiles: string[] = []
+  let fileIndex = 0
+
+  try {
+    // Process each content item
+    for (const item of contentSequence) {
+      try {
+        console.log(`Processing ${item.type} content: ${item.contentId.substring(0, 50)}...`);
+        
+        if (item.type === "video") {
+          // Download video
+          const videoPath = path.join(tempDir, `video_${fileIndex}.mp4`)
+          await downloadContent(item.contentId, videoPath, true)
+          processedFiles.push(videoPath)
+        } else if (item.type === "image") {
+          // Download image
+          const imagePath = path.join(tempDir, `image_${fileIndex}.jpg`)
+          
+          try {
+            await downloadContent(item.contentId, imagePath, false)
+          } catch (error: any) {
+            console.error(`Failed to download image: ${error.message}`);
+            // Create a placeholder image instead of failing
+            await createPlaceholderImage(imagePath);
+            console.log(`Created placeholder for failed download: ${item.contentId}`);
+          }
+          
+          // Convert image to video segment with enhanced error handling
+          const videoPath = path.join(tempDir, `image_video_${fileIndex}.mp4`)
+          await convertImageToVideo(imagePath, videoPath, item.duration)
+          processedFiles.push(videoPath)
+          
+          // Clean up the image file
+          await unlink(imagePath).catch(() => {});
+        }
+        
+        fileIndex++
+      } catch (error: any) {
+        console.error(`Error processing content item: ${error.message}`)
+        // Continue with next item instead of failing the entire process
+      }
+    }
+
+    return processedFiles
+  } catch (error) {
+    console.error("Error processing content:", error)
+    throw error
+  }
 } 

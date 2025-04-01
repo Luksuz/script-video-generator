@@ -31,6 +31,7 @@ interface ContentResult {
     thumbnail: string
     isAiGenerated?: boolean
     revisedPrompt?: string
+    isPlaceholder?: boolean
   }[]
   aiImages?: {
     url: string
@@ -77,17 +78,25 @@ export default function ResultsPage() {
   const [customQueries, setCustomQueries] = useState<Record<number, string>>({})
   const [regeneratingSection, setRegeneratingSection] = useState<number | null>(null)
 
+
   useEffect(() => {
     const fetchResults = async () => {
       try {
-        const response = await fetch("/api/process-script")
-
-        if (!response.ok) {
-          throw new Error("Failed to fetch results")
+        // Get results from localStorage instead of making a fetch request
+        const storedResults = localStorage.getItem("processingResults")
+        
+        if (!storedResults) {
+          throw new Error("No results found")
         }
-
-        const data: ProcessingResults = await response.json()
+        
+        const data: ProcessingResults = JSON.parse(storedResults)
         setResults(data)
+
+        // Also check if there's a final video in localStorage
+        const storedFinalVideo = localStorage.getItem("finalVideo")
+        if (storedFinalVideo) {
+          setFinalVideo(storedFinalVideo)
+        }
 
         // Calculate section types based on mode and content distribution
         const types: ('video' | 'image')[] = []
@@ -115,7 +124,7 @@ export default function ResultsPage() {
         })
         setSelectedContent(initialSelected)
       } catch (err) {
-        setError("An error occurred while fetching results")
+        setError("No processing results found. Please go back and process your script first.")
         console.error(err)
       } finally {
         setLoading(false)
@@ -201,6 +210,12 @@ export default function ResultsPage() {
 
       const data = await response.json()
       setFinalVideo(data.videoPath)
+      
+      // Store the video data in localStorage
+      localStorage.setItem("finalVideo", data.videoPath)
+      
+      // No need to navigate - we're already on the results page
+      // router.push(`/results?resultId=${data.id}`)
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to concatenate content")
       console.error(err)
@@ -523,18 +538,27 @@ export default function ResultsPage() {
                     {sectionType === 'image' && result.images.map((image, imageIndex) => (
                       <TabsContent key={`${image.url}-${imageIndex}`} value={`image-${imageIndex}-${index}`} className="m-0">
                         <div className="aspect-video bg-muted relative">
-                          <img
-                            src={image.thumbnail || image.url}
-                            alt={`Image preview for ${result.query}`}
-                            className="w-full h-full object-cover"
-                          />
-                          {image.isAiGenerated && (
+                          {image.isPlaceholder ? (
+                            <div className="w-full h-full flex items-center justify-center">
+                              <div className="text-center">
+                                <Loader2 className="h-8 w-8 animate-spin mx-auto mb-4" />
+                                <p className="text-sm text-muted-foreground">AI image is being generated...</p>
+                              </div>
+                            </div>
+                          ) : (
+                            <img
+                              src={image.thumbnail || image.url}
+                              alt={`Image preview for ${result.query}`}
+                              className="w-full h-full object-cover"
+                            />
+                          )}
+                          {image.isAiGenerated && !image.isPlaceholder && (
                             <div className="absolute top-2 left-2 bg-primary text-primary-foreground text-xs px-2 py-1 rounded-md">
                               AI Generated
                             </div>
                           )}
                           <div className="absolute bottom-4 right-4 flex gap-2">
-                            <Button size="sm" variant="secondary" asChild>
+                            <Button size="sm" variant="secondary" asChild disabled={image.isPlaceholder}>
                               <a href={image.url} target="_blank" rel="noopener noreferrer">
                                 <Download className="mr-2 h-4 w-4" />
                                 View Full Image
@@ -544,12 +568,16 @@ export default function ResultsPage() {
                         </div>
                         <div className="p-4 bg-muted/50">
                           <p className="text-sm text-muted-foreground">
-                            Target Duration: {result.segmentDuration.toFixed(1)}s | Resolution: {image.width}x{image.height}
-                            {image.isAiGenerated && image.revisedPrompt && (
+                            Target Duration: {result.segmentDuration.toFixed(1)}s | 
+                            {!image.isPlaceholder && `Resolution: ${image.width}x${image.height}`}
+                            {image.isAiGenerated && image.revisedPrompt && !image.isPlaceholder && (
                               <>
                                 <br />
                                 <span className="font-medium">AI prompt:</span> {image.revisedPrompt}
                               </>
+                            )}
+                            {image.isPlaceholder && (
+                              <span className="animate-pulse"> AI image processing...</span>
                             )}
                           </p>
                         </div>

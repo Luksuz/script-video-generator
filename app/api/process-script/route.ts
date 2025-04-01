@@ -5,9 +5,6 @@ import { openai } from "@ai-sdk/openai"
 // Import helpers instead of defining them inline
 import { searchPexelsVideos, searchPixabayVideos, searchImages, generateAIImage, type VideoProvider } from "./helpers"
 
-// In-memory storage for results (in a production app, use a database)
-let processingResults: any = null
-
 // Function to search videos based on provider
 async function searchVideos(query: string, provider: VideoProvider) {
   return provider === "pexels" ? searchPexelsVideos(query) : searchPixabayVideos(query)
@@ -106,60 +103,42 @@ export async function POST(request: NextRequest) {
       }),
     )
 
-    // Search for content using selected API
+    // First, prepare the content results with videos if needed
     const contentResults = await Promise.all(
-      contentQueries.map(async ({ segment, query, duration }) => {
+      contentQueries.map(async ({ segment, query, duration }, index) => {
         let videos: any[] = []
         let images: any[] = []
         let aiImages: any[] = []
         let imageDurations: number[] = []
 
+        // Always fetch videos if needed
         if (mode === "videos" || mode === "mixed") {
           const videoResponse = await searchVideos(query, provider)
           videos = videoResponse.videos.map((v: any) => ({ ...v, targetDuration: duration }))
         }
 
-        if (mode === "images" || mode === "mixed") {
+        // Only search for regular images if AI generation is not enabled
+        // or if we're in video-only mode (where images aren't used anyway)
+        if ((mode === "images" || mode === "mixed") && !generateAiImages) {
           const imageResponse = await searchImages(query)
           images = imageResponse
           // Use the target duration for all images in this segment
           imageDurations = images.map(() => duration)
         }
 
-        // Generate AI images if requested
-        if (generateAiImages) {
-          try {
-            // Create a better prompt for AI image generation by using both the segment and search query
-            let aiPrompt = "";
-            
-            // If the theme is provided, include it for context
-            if (theme) {
-              aiPrompt += `Theme: ${theme}. `;
-            }
-            
-            // Add the segment for context
-            aiPrompt += `Create a visual representation of: "${segment}". `;
-            
-            // Add the search query for more specific guidance
-            aiPrompt += `Focus on: ${query}.`;
-            
-            const aiImage = await generateAIImage(aiPrompt);
-            aiImages = [aiImage];
-            
-            // Add the AI image to regular images array so it can be displayed in the UI
-            images.unshift({
-              ...aiImage,
-              isAiGenerated: true
-            });
-            
-            // Add duration for the AI image
-            imageDurations.unshift(duration);
-            
-            console.log(`Generated AI image for segment: "${segment.substring(0, 50)}..."`);
-          } catch (error) {
-            console.error(`Failed to generate AI image for segment: "${segment.substring(0, 50)}..."`, error);
-            // Continue processing even if AI image generation fails
-          }
+        // For AI images, we'll add placeholders that will be filled in later
+        // This avoids overwhelming the OpenAI API with too many concurrent requests
+        if (generateAiImages && (mode === "images" || mode === "mixed")) {
+          // Add an empty placeholder for now
+          images = [{
+            url: "/placeholder.svg",
+            width: 1024,
+            height: 1024,
+            thumbnail: "/placeholder.svg",
+            isAiGenerated: true,
+            isPlaceholder: true
+          }]
+          imageDurations = [duration]
         }
 
         return {
@@ -169,19 +148,78 @@ export async function POST(request: NextRequest) {
           images,
           aiImages,
           imageDurations,
-          segmentDuration: duration
+          segmentDuration: duration,
+          index // Keep track of the original index
         }
       }),
     )
 
-    // Store results for the results page
-    processingResults = {
+    // If AI image generation is enabled, process it in a controlled manner
+    if (generateAiImages && (mode === "images" || mode === "mixed")) {
+      console.log(`Generating AI images for ${contentResults.length} segments with rate limiting...`);
+      
+      // Process segments in sequential order with rate limiting
+      for (let i = 0; i < contentResults.length; i++) {
+        const result = contentResults[i];
+        const progress = `(${i + 1}/${contentResults.length})`; // Add progress counter
+        
+        try {
+          // Create a better prompt for AI image generation
+          let aiPrompt = "";
+          
+          // If the theme is provided, include it for context
+          if (theme) {
+            aiPrompt += `Theme: ${theme}. `;
+          }
+          
+          // Add the segment for context
+          aiPrompt += `Create a visual representation of: "${result.segment}". `;
+          
+          // Add the search query for more specific guidance
+          aiPrompt += `Focus on: ${result.query}.`;
+          
+          // Log progress before starting generation
+          console.log(`Generating AI image ${progress}... Prompt: \"${aiPrompt.substring(0, 80)}...\"`);
+          
+          // Generate the AI image with rate limiting built in
+          const aiImage = await generateAIImage(aiPrompt);
+          
+          // Update the contentResults with the generated image
+          result.aiImages = [aiImage];
+          result.images = [{
+            ...aiImage,
+            isAiGenerated: true
+          }];
+          
+          // Log success with progress
+          console.log(`Successfully generated AI image ${progress}`);
+        } catch (error) {
+          // Log failure with progress
+          console.error(`Failed to generate AI image ${progress}:`, error);
+          
+          // If AI image generation fails, fall back to regular image search
+          try {
+            const imageResponse = await searchImages(result.query)
+            result.images = imageResponse
+            result.imageDurations = imageResponse.map(() => result.segmentDuration)
+          } catch (searchError) {
+            console.error(`Failed to fall back to image search:`, searchError);
+            // Keep the placeholder if both methods fail
+          }
+        }
+      }
+    }
+
+    // Create the results object (remove the index we added temporarily)
+    const processedResults = contentResults.map(({ index, ...rest }) => rest);
+    
+    const processingResults = {
       wordCount,
       totalDurationInSeconds,
       totalSegments,
       wordsPerSegment,
       targetSegmentDuration,
-      contentResults,
+      contentResults: processedResults,
       provider,
       mode,
       theme,
@@ -198,14 +236,5 @@ export async function POST(request: NextRequest) {
     console.error("Error processing script:", error)
     return NextResponse.json({ error: "Failed to process script" }, { status: 500 })
   }
-}
-
-export async function GET() {
-  if (!processingResults) {
-    return NextResponse.json({ error: "No results available" }, { status: 404 })
-  }
-
-  const { totalDurationInSeconds, ...rest } = processingResults
-  return NextResponse.json({ totalDurationInSeconds, ...rest })
 }
 
