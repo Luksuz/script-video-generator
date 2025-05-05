@@ -153,7 +153,7 @@ class SupabaseStorage:
             
         # Otherwise, get the public URL
         return await self.get_file_url(path)
-        
+
     async def upload_image(self, local_path: str, destination_filename: Optional[str] = None) -> str:
         """
         Upload an image file from a local path to Supabase Storage.

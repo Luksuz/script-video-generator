@@ -156,7 +156,7 @@ async def regenerate_content(request: Request):
                 ai_image_path = await generate_ai_image(
                     prompt=ai_prompt,
                     provider=ai_provider,
-                    width=1024,
+                    width=1536,
                     height=1024,
                     model=ai_model
                 )

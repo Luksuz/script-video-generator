@@ -25,7 +25,7 @@ from models import (
 )
 from utils.search_helpers import search_pexels_videos, search_pixabay_videos, search_images, download_image
 from utils.text_generation import generate_text
-from utils.image_generation import generate_ai_image
+from utils.image_generation import generate_ai_image, generate_ai_images_batch
 from utils.supabase_storage import supabase_storage
 from utils.supabaseDB import supabase_db
 
@@ -536,7 +536,9 @@ async def process_text_content_for_ai_images_generation(
     
     # Generate content queries for each segment
     content_queries = []
-    for i, segment in enumerate(segments):
+    
+    # Generate prompts concurrently
+    async def generate_prompt_for_segment(segment, idx):
         # Generate a search query for this segment
         image_generation_prompt = f"""
             You are an expert in image generation.
@@ -556,52 +558,84 @@ async def process_text_content_for_ai_images_generation(
         
         query = await generate_text(image_generation_prompt)
         
-        content_queries.append({
+        return {
             "segment": segment,
             "query": query.strip(),
-            "duration": segment_durations[i],  # Use the calculated duration for this segment
-            "index": i
-        })
-        
-    # Process content queries to get videos/images
-    content_results = []
+            "duration": segment_durations[idx],
+            "index": idx
+        }
+    
+    # Generate all prompts concurrently
+    prompt_tasks = [generate_prompt_for_segment(segment, i) for i, segment in enumerate(segments)]
+    content_queries = await asyncio.gather(*prompt_tasks)
+    
+    # Sort queries by index to ensure order
+    content_queries.sort(key=lambda x: x["index"])
+    
+    # Extract just the generation prompts to pass to batch function
+    all_prompts = [query_data["query"] for query_data in content_queries]
+    
+    logger.info(f"Starting batch generation of {len(all_prompts)} images with {ai_provider}")
+    
+    # Generate all images in a batch (with provider-specific batching)
+    image_paths = await generate_ai_images_batch(
+        prompts=all_prompts,
+        provider=ai_provider,
+        width=1536,
+        height=1024,
+        model=ai_model
+    )
+    
+    # Process the results and create content sections
+    content_sections = []
     processed_count = 0
     
-    for query_data in content_queries:
+    # Process each result
+    for idx, (query_data, image_path) in enumerate(zip(content_queries, image_paths)):
         segment = query_data["segment"]
         query = query_data["query"]
         duration = query_data["duration"]
         index = query_data["index"]
         
-        videos = []
-        images = []
-        ai_images = []
-        image_durations = []
-            
-        # Generate AI images if requested
-        try:
-            logger.info(f"Generating AI image for segment {index+1}/{len(content_queries)}")
-            
-            # Generate AI image for this segment
-            ai_image_path = await generate_ai_image(
-                prompt=query,
-                provider=ai_provider,
-                width=1024,
-                height=1024,
-                model=ai_model
+        # Skip if image generation failed
+        if not image_path:
+            logger.error(f"Failed to generate image for segment {index+1}")
+            content_section = ContentSection(
+                segment=segment,
+                query=query,
+                videos=[],
+                images=[],
+                aiImages=[],
+                imageDurations=[],
+                segmentDuration=duration,
+                index=index
             )
-            
+            content_sections.append(content_section)
+            continue
+        
+        try:
             # Extract the filename from the path
-            ai_image_filename = os.path.basename(ai_image_path)
+            ai_image_filename = os.path.basename(image_path)
             
             # Upload to Supabase storage
             supabase_url = await supabase_storage.upload_image(
-                local_path=ai_image_path,
+                local_path=image_path,
                 destination_filename=ai_image_filename
             )
             
             if not supabase_url:
-                logger.warning("Failed to upload AI image to Supabase, skipping image")
+                logger.warning(f"Failed to upload AI image to Supabase for segment {index+1}, skipping image")
+                content_section = ContentSection(
+                    segment=segment,
+                    query=query,
+                    videos=[],
+                    images=[],
+                    aiImages=[],
+                    imageDurations=[],
+                    segmentDuration=duration,
+                    index=index
+                )
+                content_sections.append(content_section)
                 continue
             
             # Create content record in the created_content table
@@ -623,37 +657,51 @@ async def process_text_content_for_ai_images_generation(
                 "source": ai_provider
             }
             
-            ai_images = [ai_image_result]
-            images = [ImageResult(**ai_image_result)]
-            image_durations = [duration]
+            # Create content section
+            content_section = ContentSection(
+                segment=segment,
+                query=query,
+                videos=[],
+                images=[ImageResult(**ai_image_result)],
+                aiImages=[ai_image_result],
+                imageDurations=[duration],
+                segmentDuration=duration,
+                index=index
+            )
             
-            # Increment processed count and update in database
+            content_sections.append(content_section)
+            
+            # Increment processed count
             processed_count += 1
-            await supabase_db.update_processed_segment_count(job_id, processed_count)
             
             # Increment video segments completed count
             await supabase_db.increment_video_segments_completed(job_id)
             
-            logger.info(f"Successfully generated AI image for segment {index+1}. Processed {processed_count}/{total_segments}")
+            logger.info(f"Successfully processed AI image for segment {index+1}")
             
         except Exception as e:
-            logger.error(f"Failed to generate AI image: {str(e)}")
-        
-        # Create content section
-        content_section = ContentSection(
-            segment=segment,
-            query=query,
-            videos=videos,
-            images=images,
-            aiImages=ai_images,
-            imageDurations=image_durations,
-            segmentDuration=duration,
-            index=index
-        )
-        
-        content_results.append(content_section)
-        
-    return content_results 
+            logger.error(f"Failed to process generated image for segment {index+1}: {str(e)}")
+            content_section = ContentSection(
+                segment=segment,
+                query=query,
+                videos=[],
+                images=[],
+                aiImages=[],
+                imageDurations=[],
+                segmentDuration=duration,
+                index=index
+            )
+            content_sections.append(content_section)
+    
+    # Update processed segment count in the database
+    await supabase_db.update_processed_segment_count(job_id, processed_count)
+    
+    # Sort sections by index to ensure order
+    content_sections.sort(key=lambda x: x.index)
+    
+    logger.info(f"Completed AI image generation. Generated {processed_count}/{total_segments} images")
+    
+    return content_sections
 
 async def process_text_content_for_images_fetching(
     file_content: str,
@@ -1471,8 +1519,8 @@ async def regenerate_ai_image_content(query: str, job_id: str, job_mode: str) ->
         ai_image_path = await generate_ai_image(
             prompt=query,
             provider=ai_provider,
-            width=512,
-            height=512,
+            width=1536,
+            height=1024,
         )
         
         # Upload to Supabase
@@ -1832,7 +1880,7 @@ async def process_mixed_content(
                             ai_image_path = await generate_ai_image(
                                 prompt=ai_prompt,
                                 provider=ai_provider,
-                                width=1024,
+                                width=1536,
                                 height=1024
                             )
                             
