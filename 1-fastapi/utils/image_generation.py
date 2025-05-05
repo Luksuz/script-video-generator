@@ -1,10 +1,11 @@
 import os
 import requests
-from typing import Optional, Literal
+from typing import Optional, Literal, Dict, Any
 import time
 import logging
+import asyncio
 from io import BytesIO
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 import os
 import base64
 from PIL import Image as PILImage
@@ -29,8 +30,56 @@ MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY")
 RATE_LIMIT_CALLS = 5       # Number of calls allowed
 RATE_LIMIT_PERIOD = 60     # In seconds (1 minute)
 
-# Keep track of API calls for rate limiting
-api_call_timestamps = []
+# Provider-specific rate limiting settings
+provider_rate_limits: Dict[str, Dict[str, Any]] = {
+    "openai": {
+        "calls": 5,
+        "period": 60,
+        "timestamps": [],
+        "lock": asyncio.Lock()
+    },
+    "google": {
+        "calls": 5,
+        "period": 60,
+        "timestamps": [],
+        "lock": asyncio.Lock()
+    },
+    "minimax": {
+        "calls": float('inf'),  # Unlimited
+        "period": 60,
+        "timestamps": [],
+        "lock": asyncio.Lock()
+    }
+}
+
+async def check_rate_limit(provider: AIImageProvider) -> None:
+    """Check rate limit for the specified provider and wait if necessary."""
+    # Skip rate limiting for providers with unlimited calls
+    if provider_rate_limits[provider]["calls"] == float('inf'):
+        return
+    
+    async with provider_rate_limits[provider]["lock"]:
+        current_time = time.time()
+        timestamps = provider_rate_limits[provider]["timestamps"]
+        
+        # Remove timestamps older than the rate limit period
+        provider_rate_limits[provider]["timestamps"] = [
+            ts for ts in timestamps if current_time - ts < provider_rate_limits[provider]["period"]
+        ]
+        
+        # Check if we've hit the rate limit
+        if len(provider_rate_limits[provider]["timestamps"]) >= provider_rate_limits[provider]["calls"]:
+            wait_time = provider_rate_limits[provider]["period"] - (current_time - provider_rate_limits[provider]["timestamps"][0])
+            logger.info(f"Rate limit reached for {provider}. Waiting {wait_time:.2f} seconds...")
+            await asyncio.sleep(wait_time)
+            # Refresh the timestamp list after waiting
+            current_time = time.time()
+            provider_rate_limits[provider]["timestamps"] = [
+                ts for ts in timestamps if current_time - ts < provider_rate_limits[provider]["period"]
+            ]
+        
+        # Add the current timestamp
+        provider_rate_limits[provider]["timestamps"].append(current_time)
 
 async def generate_ai_image(
     prompt: str,
@@ -40,7 +89,7 @@ async def generate_ai_image(
     output_dir: str = "images",
     output_filename: Optional[str] = None,
     aspect_ratio: str = "1:1",
-    model: str = "dall-e-3"  # Default model for OpenAI
+    model: str = "gpt-image-1"  # Default model for OpenAI
 ) -> str:
     """
     Generate an AI image using the specified provider.
@@ -58,23 +107,8 @@ async def generate_ai_image(
     Returns:
         Path to the generated image
     """
-    # Rate limiting check
-    global api_call_timestamps
-    current_time = time.time()
-    
-    # Remove timestamps older than the rate limit period
-    api_call_timestamps = [ts for ts in api_call_timestamps if current_time - ts < RATE_LIMIT_PERIOD]
-    
-    # Check if we've hit the rate limit
-    if len(api_call_timestamps) >= RATE_LIMIT_CALLS:
-        wait_time = RATE_LIMIT_PERIOD - (current_time - api_call_timestamps[0])
-        logger.info(f"Rate limit reached. Waiting {wait_time:.2f} seconds...")
-        time.sleep(wait_time)
-        # Refresh the timestamp list after waiting
-        api_call_timestamps = [ts for ts in api_call_timestamps if current_time - ts < RATE_LIMIT_PERIOD]
-    
-    # Add the current timestamp
-    api_call_timestamps.append(current_time)
+    # Apply rate limiting based on provider
+    await check_rate_limit(provider)
     
     # Create output filename if not provided
     if not output_filename:
@@ -85,18 +119,19 @@ async def generate_ai_image(
     output_path = os.path.join(output_dir, output_filename)
     
     try:
+        logger.info(f"Generating image with {provider} provider: prompt={prompt[:50]}...")
         if provider == "openai":
             if not OPENAI_API_KEY:
                 raise ValueError("OPENAI_API_KEY environment variable is not set")
             
             # Initialize OpenAI client
-            client = OpenAI(api_key=OPENAI_API_KEY)
+            client = AsyncOpenAI(api_key=OPENAI_API_KEY)
             
             if model == "gpt-image-1":
                 logger.info(f"Generating image with OpenAI GPT-Image-1: prompt={prompt[:50]}...")
                 
                 # Generate image with GPT-Image-1
-                response = client.images.generate(
+                response = await client.images.generate(
                     model="gpt-image-1",
                     prompt=prompt,
                     n=1,
@@ -121,7 +156,7 @@ async def generate_ai_image(
                 elif width == 1792 and height == 1024:
                     size = "1792x1024"
                 
-                response = client.images.generate(
+                response = await client.images.generate(
                     model="dall-e-3",
                     prompt=prompt,
                     size=size,
@@ -131,13 +166,15 @@ async def generate_ai_image(
                 
                 image_url = response.data[0].url
                 
-                # Download the image
-                image_response = requests.get(image_url)
-                if image_response.status_code == 200:
-                    with open(output_path, 'wb') as f:
-                        f.write(image_response.content)
-                else:
-                    raise Exception(f"Failed to download image: {image_response.status_code}")
+                # Download the image asynchronously
+                async with requests.sessions.Session() as session:
+                    async with session.get(image_url) as response:
+                        if response.status == 200:
+                            image_content = await response.read()
+                            with open(output_path, 'wb') as f:
+                                f.write(image_content)
+                        else:
+                            raise Exception(f"Failed to download image: {response.status}")
                 
         elif provider == "google":
             if not GEMINI_API_KEY:
@@ -224,7 +261,8 @@ async def generate_ai_image(
                 'Content-Type': 'application/json'
             }
             
-            # Make the API request
+            # Make the API request - for Minimax we don't need rate limiting
+            # so we can use the standard requests library
             response = requests.request("POST", url, headers=headers, data=payload)
             
             if response.status_code != 200:

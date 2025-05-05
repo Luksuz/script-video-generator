@@ -153,6 +153,50 @@ class SupabaseStorage:
             
         # Otherwise, get the public URL
         return await self.get_file_url(path)
+        
+    async def upload_image(self, local_path: str, destination_filename: Optional[str] = None) -> str:
+        """
+        Upload an image file from a local path to Supabase Storage.
+        
+        Args:
+            local_path: Path to the local file
+            destination_filename: Optional new filename (will use original filename if not provided)
+            
+        Returns:
+            The URL of the uploaded file
+        """
+        try:
+            # Use the original filename if destination_filename not provided
+            if not destination_filename:
+                destination_filename = os.path.basename(local_path)
+            
+            # Read the file content
+            with open(local_path, 'rb') as f:
+                file_content = f.read()
+                
+            # Determine content type based on file extension
+            content_type = None
+            ext = os.path.splitext(destination_filename)[1].lower()
+            if ext in ['.jpg', '.jpeg']:
+                content_type = 'image/jpeg'
+            elif ext == '.png':
+                content_type = 'image/png'
+            elif ext == '.gif':
+                content_type = 'image/gif'
+            elif ext == '.webp':
+                content_type = 'image/webp'
+            
+            # Use the upload_file method to upload
+            return await self.upload_file(
+                file_content=file_content,
+                file_name=destination_filename,
+                folder="images",
+                content_type=content_type
+            )
+            
+        except Exception as e:
+            logger.error(f"Error uploading image: {str(e)}")
+            raise
 
 # Create a singleton instance
 supabase_storage = SupabaseStorage() 

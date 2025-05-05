@@ -372,10 +372,10 @@ async def process_image_content(
         speaking_rate: Words per minute speaking rate
     """
     try:
-        if generate_ai_images:
+        if provider == "openai-gpt-image" or provider == "google" or provider == "minimax":
             # Choose appropriate AI provider based on the user selection
             ai_provider = "openai"  # Default
-            ai_model = "dall-e-3"  # Default model
+            ai_model = "gpt-image-1"  # Default model
             
             if provider == "google":
                 ai_provider = "google"

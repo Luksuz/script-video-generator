@@ -1,6 +1,7 @@
 import os
 import uuid
 import logging
+import json
 from typing import Optional, Dict, Any, List, Union, Literal
 from supabase import create_client, Client
 
@@ -603,6 +604,82 @@ class SupabaseDB:
         except Exception as e:
             logger.error(f"Error incrementing video segments completed count: {str(e)}")
             return False
+
+    async def update_job_result(self, job_id: str, result_data: Dict[str, Any]) -> bool:
+        """
+        Update the job result data in Supabase db.
+        
+        Args:
+            job_id: The job ID
+            result_data: The result data to store
+            
+        Returns:
+            True if updated successfully
+        """
+        try:
+            logger.info(f"Updating job result data for job: {job_id}")
+            
+            # Serialize result data to JSON string
+            result_json = json.dumps(result_data)
+            
+            response = self.client.table("jobs").update({
+                "result": result_json
+            }).eq("id", job_id).execute()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating job result: {str(e)}")
+            return False
+    
+    async def create_content_record(self, job_id: str, content_type: str, segment_text: str, 
+                              search_query: str, url: str, provider: str, 
+                              supabase_url: Optional[str] = None, json_data: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Create a content record in the content_segments table.
+        
+        Args:
+            job_id: The job ID
+            content_type: Type of content (video, image, ai_image)
+            segment_text: The text segment
+            search_query: The search query used
+            url: URL of the content
+            provider: Provider of the content (pexels, pixabay, openai, etc.)
+            supabase_url: Optional Supabase storage URL
+            json_data: Optional JSON data
+            
+        Returns:
+            Created content record
+        """
+        try:
+            logger.info(f"Creating content record for job {job_id}, type: {content_type}")
+            
+            record_data = {
+                "job_id": job_id,
+                "content_type": content_type,
+                "segment_text": segment_text,
+                "search_query": search_query,
+                "url": url,
+                "provider": provider
+            }
+            
+            if supabase_url:
+                record_data["supabase_url"] = supabase_url
+                
+            if json_data:
+                record_data["json_data"] = json_data
+            
+            response = self.client.table("content_segments").insert(record_data).execute()
+            
+            # Extract the actual data from the response
+            if hasattr(response, 'data') and response.data:
+                return response.data[0] if response.data else {}
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error creating content record: {str(e)}")
+            raise
 
 # Create a singleton instance
 supabase_db = SupabaseDB() 
